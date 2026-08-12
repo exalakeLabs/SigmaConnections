@@ -56,7 +56,7 @@ def _request_location(entry: dict[str, Any], connection_type: str) -> dict[str, 
 def build_update_payload(
     current: dict[str, Any], catalog: str, schema: str, oauth_client_secret: str = ""
 ) -> dict[str, Any]:
-    """Build a PUT payload from a fetched connection and append a writeback location."""
+    """Preserve all fetched writebacks and append catalog/schema as a new destination."""
     if not catalog.strip() or not schema.strip():
         raise ValueError("Catalog and schema cannot be empty.")
 
@@ -278,7 +278,10 @@ def main() -> int:
         response.raise_for_status()
         result = response.json()
         writebacks = result.get("writebackSchemas") or result.get("writebacks") or []
-        print(f"Added a writeback location to {args.connection_name!r} ({connection_id}).")
+        print(
+            f"Added writeback destination {args.catalog}.{args.schema} "
+            f"to {args.connection_name!r} ({connection_id})."
+        )
         print(json.dumps(writebacks, indent=2))
         return 0
     except (ValueError, RuntimeError) as exc:

@@ -4,6 +4,8 @@ This repository contains a small utility for changing where a Sigma connection w
 
 The utility does not create a connection or change how Sigma reads data. It resolves the connection by name, retrieves its current state, converts the retrieved values into a connection update payload, appends a new location, and sends that payload to Sigma. Sigma's update endpoint uses `PUT`.
 
+The existing Sigma connection remains the same connection. The operation adds a **new writeback destination** defined by `WRITEBACK_CATALOG` and `WRITEBACK_SCHEMA`; it does not replace an existing writeback destination. All existing entries remain in `writebackSchemas` ahead of the newly appended entry.
+
 ## What it changes
 
 The automatic payload builder currently supports Databricks connections using either OAuth or non-OAuth authentication:
