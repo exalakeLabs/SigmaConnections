@@ -2,7 +2,7 @@
 
 This repository contains a small utility for changing where a Sigma connection writes data. It updates the connection's **writeback catalog/database and schema** through the Sigma API.
 
-The utility does not create a connection or change how Sigma reads data. It takes an existing connection update payload, changes only its writeback location, resolves the connection by name, and sends the complete payload to Sigma. A complete payload is required because Sigma's connection update endpoint uses `PUT`.
+The utility does not create a connection or change how Sigma reads data. It resolves the connection by name, retrieves its current state, preserves its existing writeback locations, appends a new location, and sends the complete update payload to Sigma. A complete payload is required because Sigma's connection update endpoint uses `PUT`.
 
 ## What it changes
 
@@ -23,7 +23,7 @@ All other fields from the supplied payload are preserved.
 
 ## Use the Databricks notebook
 
-The notebook is intended to run inside a Databricks workspace and update the first writeback location for a Sigma Databricks OAuth connection.
+The notebook is intended to run inside a Databricks workspace and add a writeback location to a Sigma Databricks OAuth connection.
 
 ### 1. Import and attach the notebook
 
@@ -58,6 +58,18 @@ In the **Existing connection payload** cell, replace the placeholders with the e
 
 Keep every other property required by the existing Sigma connection. The notebook submits this object with `PUT`, so omitted connection properties may not be preserved. The connection name is populated from the `connection_name` widget, and the four credentials are loaded from the configured secret scope.
 
+If the Databricks HTTP path is configured with **Use User Attribute**, the retrieved connection includes a `userAttributes.warehouse` mapping. The notebook copies that mapping into `details.userAttributes` in the update payload so the HTTP-path user attribute remains enabled. Confirm it appears in the dry-run output, for example:
+
+```json
+{
+  "details": {
+    "userAttributes": {
+      "warehouse": "HTTP_PATH_USER_ATTRIBUTE"
+    }
+  }
+}
+```
+
 ### 4. Set the notebook widgets
 
 Run the widget cell, then provide values at the top of the notebook:
@@ -77,7 +89,7 @@ Run the widget cell, then provide values at the top of the notebook:
 
 ### 5. Run and review the dry run
 
-Run all cells with `dry_run` set to `true`. The final cell builds and prints the payload but does not authenticate to Sigma or update the connection. Confirm that:
+Run all cells with `dry_run` set to `true`. The notebook authenticates, resolves the connection, and retrieves its current state, but it does not submit the `PUT` update. Confirm that:
 
 - The connection name is correct.
 - `writeCatalog` and `writeSchema` contain the intended destination.
@@ -91,7 +103,7 @@ Change `dry_run` to `false` and rerun the notebook. It authenticates to Sigma, f
 
 The notebook stops without updating anything if the connection name has no exact active match or matches multiple active connections. After a successful update, verify the connection and writeback destination in Sigma before relying on it for production writes.
 
-> **Note:** The notebook updates only the first entry in `details.writebackSchemas`. Use the command-line utility with `--writeback-index` if you need to update another entry.
+The notebook rejects the request if the same catalog and schema already exist. Otherwise, it preserves all retrieved writeback locations and appends the new one.
 
 ## Requirements
 
@@ -120,7 +132,7 @@ The payload must contain at least a non-empty `name` and a `details` object with
 
 ## Preview the change
 
-Use a dry run first. It prints the updated JSON without authenticating or making an API request:
+Use a dry run first. It authenticates to Sigma and retrieves the current connection, then prints the proposed payload without submitting the update:
 
 ```bash
 python connection-writeback/update-connection-writeback.py \
@@ -152,25 +164,17 @@ The script:
 
 1. Authenticates with Sigma using client credentials.
 2. Finds one active connection whose name exactly matches `--connection-name`.
-3. Updates the writeback location in a copy of the supplied payload.
-4. Sends the complete updated payload to `/v2/connections/{connectionId}`.
+3. Retrieves the current connection with `GET /v2/connections/{connectionId}`.
+4. Copies all existing writeback locations into the supplied update payload and appends the new location.
+5. Sends the complete payload with `PUT /v2/connections/{connectionId}`.
 
 The command stops if no exact active match is found or if multiple active connections share the same name.
 
-## Multiple OAuth writeback locations
+## How existing locations are preserved
 
-By default, the first `writebackSchemas` entry is updated. Select another zero-based entry with `--writeback-index`:
+Sigma's connection-details response represents writeback locations differently from the connection update request. The project converts each retrieved `database`/`schema` pair to the request form (`writeCatalog`/`writeSchema` for Databricks, or `writeDatabase`/`writeSchema` for other supported types), retains its description when present, and appends the requested location. It refuses to add an exact duplicate.
 
-```bash
-python connection-writeback/update-connection-writeback.py \
-  --connection-name "My Sigma Connection" \
-  --catalog "TARGET_CATALOG" \
-  --schema "TARGET_SCHEMA" \
-  --payload-file connection.json \
-  --writeback-index 1
-```
-
-If the index equals the current number of entries, a new location is appended. An index beyond the next available position is rejected.
+The payload file is still required. The GET endpoint returns the current connection state but might omit write-only or redacted values such as secrets. Keep those required values in the complete update payload rather than assuming that the GET response can be sent directly back to Sigma. When the retrieved connection contains `userAttributes`, the utility also preserves that object in `details.userAttributes`; for Databricks, its `warehouse` entry retains **Use User Attribute** for the HTTP path.
 
 ## Optional API base URL
 

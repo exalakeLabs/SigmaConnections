@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Update the catalog and schema used for Sigma connection writeback.
+"""Add a catalog and schema to a Sigma connection's writeback locations.
 
 Sigma's supported connection update endpoint uses PUT, so it requires the full
 connection payload. Pass a JSON file containing the connection's existing
-``name`` and ``details`` properties; this script changes only the writeback
-location before submitting it.
+``name`` and ``details`` properties. The script retrieves the current connection,
+preserves its writeback locations, appends the requested location, and submits
+the complete result.
 """
 
 from __future__ import annotations
@@ -39,12 +40,10 @@ def parse_args() -> argparse.Namespace:
         help="JSON file containing the full existing Sigma connection update payload",
     )
     parser.add_argument(
-        "--writeback-index",
-        type=int,
-        default=0,
-        help="OAuth writebackSchemas entry to update (default: 0)",
+        "--dry-run",
+        action="store_true",
+        help="Retrieve the connection and print the payload without updating it",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Print the updated payload only")
     return parser.parse_args()
 
 
@@ -61,12 +60,23 @@ def load_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-def set_writeback_location(
-    payload: dict[str, Any], catalog: str, schema: str, writeback_index: int = 0
+def _request_location(entry: dict[str, Any], connection_type: str) -> dict[str, Any]:
+    """Convert a GET writeback entry to the shape accepted by connection PUT."""
+    database_key = "writeCatalog" if connection_type in CATALOG_CONNECTION_TYPES else "writeDatabase"
+    database = entry.get(database_key) or entry.get("database") or entry.get("catalog")
+    schema = entry.get("writeSchema") or entry.get("schema")
+    if not database or not schema:
+        raise ValueError(f"Retrieved writeback entry is incomplete: {entry!r}")
+    location = {database_key: database, "writeSchema": schema}
+    if entry.get("description") is not None:
+        location["description"] = entry["description"]
+    return location
+
+
+def add_writeback_location(
+    payload: dict[str, Any], current: dict[str, Any], catalog: str, schema: str
 ) -> dict[str, Any]:
-    """Return a copy of payload with its selected writeback location updated."""
-    if writeback_index < 0:
-        raise ValueError("--writeback-index cannot be negative.")
+    """Preserve fetched connection settings and append one writeback location."""
     if not catalog.strip() or not schema.strip():
         raise ValueError("Catalog and schema cannot be empty.")
 
@@ -75,29 +85,47 @@ def set_writeback_location(
     connection_type = str(details.get("type", "")).lower()
     if not connection_type:
         raise ValueError("Payload details must contain the connection 'type'.")
+    if current.get("name") != updated["name"]:
+        raise ValueError("Retrieved connection name does not match the payload name.")
+    if str(current.get("type", "")).lower() != connection_type:
+        raise ValueError("Retrieved connection type does not match the payload connection type.")
+    if bool(current.get("useOauth")) != bool(details.get("useOauth")):
+        raise ValueError("Retrieved connection OAuth mode does not match the payload.")
+
+    user_attributes = current.get("userAttributes")
+    if user_attributes is not None:
+        if not isinstance(user_attributes, dict):
+            raise ValueError("Retrieved userAttributes must be an object.")
+        if user_attributes:
+            details["userAttributes"] = deepcopy(user_attributes)
 
     database_key = "writeCatalog" if connection_type in CATALOG_CONNECTION_TYPES else "writeDatabase"
     location = {database_key: catalog, "writeSchema": schema}
 
+    def already_present(locations: list[dict[str, Any]]) -> bool:
+        return any(
+            entry.get(database_key) == catalog and entry.get("writeSchema") == schema
+            for entry in locations
+        )
+
     if details.get("useOauth"):
-        schemas = details.setdefault("writebackSchemas", [])
-        if not isinstance(schemas, list):
-            raise ValueError("details.writebackSchemas must be an array.")
-        if writeback_index > len(schemas):
-            raise ValueError(
-                f"writeback index {writeback_index} is out of range; next valid index is {len(schemas)}."
-            )
-        if writeback_index == len(schemas):
-            schemas.append(location)
-        else:
-            if not isinstance(schemas[writeback_index], dict):
-                raise ValueError("The selected writebackSchemas entry must be an object.")
-            schemas[writeback_index].update(location)
+        fetched = current.get("writebackSchemas", [])
+        if not isinstance(fetched, list):
+            raise ValueError("Retrieved writebackSchemas must be an array.")
+        schemas = [_request_location(entry, connection_type) for entry in fetched]
+        if already_present(schemas):
+            raise ValueError(f"Writeback location {catalog}.{schema} already exists.")
+        schemas.append(location)
+        details["writebackSchemas"] = schemas
     else:
-        current = details.get("writeAccess")
-        if current is not None and not isinstance(current, dict):
-            raise ValueError("details.writeAccess must be an object for non-OAuth connections.")
-        details["writeAccess"] = {**(current or {}), **location}
+        fetched = current.get("writebacks", [])
+        if not isinstance(fetched, list):
+            raise ValueError("Retrieved writebacks must be an array.")
+        writebacks = [_request_location(entry, connection_type) for entry in fetched]
+        if already_present(writebacks):
+            raise ValueError(f"Writeback location {catalog}.{schema} already exists.")
+        writebacks.append(location)
+        details["writeAccess"] = writebacks
 
     return updated
 
@@ -159,16 +187,25 @@ def resolve_connection_id(base_url: str, token: str, connection_name: str) -> st
     return str(connection_id)
 
 
+def get_connection(base_url: str, token: str, connection_id: str) -> dict[str, Any]:
+    """Retrieve the current connection state before constructing the PUT payload."""
+    if requests is None:
+        raise RuntimeError("Missing dependency: install it with 'python -m pip install requests'.")
+    response = requests.get(
+        f"{base_url}/v2/connections/{connection_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    current = response.json()
+    if not isinstance(current, dict):
+        raise RuntimeError("Sigma connection response was not a JSON object.")
+    return current
+
+
 def main() -> int:
     args = parse_args()
     try:
-        payload = set_writeback_location(
-            load_payload(args.payload_file), args.catalog, args.schema, args.writeback_index
-        )
-        if args.dry_run:
-            print(json.dumps(payload, indent=2))
-            return 0
-
         client_id = os.environ.get("SIGMA_CLIENT_ID", "")
         client_secret = os.environ.get("SIGMA_CLIENT_SECRET", "")
         if not client_id or not client_secret:
@@ -177,6 +214,15 @@ def main() -> int:
         base_url = os.environ.get("SIGMA_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
         token = get_access_token(base_url, client_id, client_secret)
         connection_id = resolve_connection_id(base_url, token, args.connection_name)
+        current = get_connection(base_url, token, connection_id)
+        payload = add_writeback_location(
+            load_payload(args.payload_file), current, args.catalog, args.schema
+        )
+        if args.dry_run:
+            print(json.dumps(payload, indent=2))
+            print("[DRY RUN] Retrieved the connection; no Sigma API update was submitted.")
+            return 0
+
         response = requests.put(
             f"{base_url}/v2/connections/{connection_id}",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -186,7 +232,7 @@ def main() -> int:
         response.raise_for_status()
         result = response.json()
         writebacks = result.get("writebackSchemas") or result.get("writebacks") or []
-        print(f"Updated connection {args.connection_name!r} ({connection_id}) writeback location.")
+        print(f"Added a writeback location to {args.connection_name!r} ({connection_id}).")
         print(json.dumps(writebacks, indent=2))
         return 0
     except (ValueError, RuntimeError) as exc:
