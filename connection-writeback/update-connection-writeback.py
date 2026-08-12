@@ -2,10 +2,9 @@
 """Add a catalog and schema to a Sigma connection's writeback locations.
 
 Sigma's supported connection update endpoint uses PUT, so it requires the full
-connection payload. Pass a JSON file containing the connection's existing
-``name`` and ``details`` properties. The script retrieves the current connection,
-preserves its writeback locations, appends the requested location, and submits
-the complete result.
+connection payload. The script retrieves the current connection, converts that
+response into an update payload, appends the requested location, and submits the
+complete result. Only secrets omitted by the GET endpoint are supplied separately.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ import json
 import os
 import sys
 from copy import deepcopy
-from pathlib import Path
 from typing import Any
 
 try:
@@ -31,33 +29,15 @@ CATALOG_CONNECTION_TYPES = {"databricks"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--connection-name", required=True)
-    parser.add_argument("--catalog", required=True, help="Catalog (database for non-Databricks connections)")
+    parser.add_argument("--catalog", required=True, help="Databricks writeback catalog")
     parser.add_argument("--schema", required=True)
-    parser.add_argument(
-        "--payload-file",
-        required=True,
-        type=Path,
-        help="JSON file containing the full existing Sigma connection update payload",
-    )
+    parser.add_argument("--output-payload", help="Optionally save the generated payload as JSON")
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Retrieve the connection and print the payload without updating it",
     )
     return parser.parse_args()
-
-
-def load_payload(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Unable to read payload file {path}: {exc}") from exc
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("details"), dict):
-        raise ValueError("Payload must be a JSON object containing a 'details' object.")
-    if not isinstance(payload.get("name"), str) or not payload["name"].strip():
-        raise ValueError("Payload must contain a non-empty connection 'name'.")
-    return payload
 
 
 def _request_location(entry: dict[str, Any], connection_type: str) -> dict[str, Any]:
@@ -73,24 +53,32 @@ def _request_location(entry: dict[str, Any], connection_type: str) -> dict[str, 
     return location
 
 
-def add_writeback_location(
-    payload: dict[str, Any], current: dict[str, Any], catalog: str, schema: str
+def build_update_payload(
+    current: dict[str, Any], catalog: str, schema: str, oauth_client_secret: str = ""
 ) -> dict[str, Any]:
-    """Preserve fetched connection settings and append one writeback location."""
+    """Build a PUT payload from a fetched connection and append a writeback location."""
     if not catalog.strip() or not schema.strip():
         raise ValueError("Catalog and schema cannot be empty.")
 
-    updated = deepcopy(payload)
-    details = updated["details"]
-    connection_type = str(details.get("type", "")).lower()
-    if not connection_type:
-        raise ValueError("Payload details must contain the connection 'type'.")
-    if current.get("name") != updated["name"]:
-        raise ValueError("Retrieved connection name does not match the payload name.")
-    if str(current.get("type", "")).lower() != connection_type:
-        raise ValueError("Retrieved connection type does not match the payload connection type.")
-    if bool(current.get("useOauth")) != bool(details.get("useOauth")):
-        raise ValueError("Retrieved connection OAuth mode does not match the payload.")
+    name = current.get("name")
+    connection_type = str(current.get("type", "")).lower()
+    if not isinstance(name, str) or not name.strip() or not connection_type:
+        raise ValueError("Retrieved connection is missing its name or type.")
+    if connection_type != "databricks":
+        raise ValueError("Automatic payload construction currently supports Databricks connections only.")
+
+    host = current.get("account") or current.get("host")
+    endpoint = current.get("warehouse") or current.get("endpoint")
+    if not host:
+        raise ValueError("Retrieved Databricks connection is missing its host/account value.")
+
+    details: dict[str, Any] = {
+        "type": connection_type,
+        "host": host,
+        "useOauth": bool(current.get("useOauth")),
+    }
+    if endpoint is not None:
+        details["endpoint"] = endpoint
 
     user_attributes = current.get("userAttributes")
     if user_attributes is not None:
@@ -98,6 +86,42 @@ def add_writeback_location(
             raise ValueError("Retrieved userAttributes must be an object.")
         if user_attributes:
             details["userAttributes"] = deepcopy(user_attributes)
+
+    for field in (
+        "materializationWarehouse",
+        "exportsWarehouse",
+        "inputTableAuditLogSchema",
+        "roleSwitching",
+    ):
+        if current.get(field) is not None:
+            details[field] = deepcopy(current[field])
+
+    if details["useOauth"]:
+        independent_oauth = bool(current.get("isIndependentOAuth"))
+        details["useOrgOauth"] = not independent_oauth
+        if independent_oauth:
+            if not oauth_client_secret:
+                raise ValueError(
+                    "Set DATABRICKS_OAUTH_CLIENT_SECRET because Sigma does not return it from GET."
+                )
+            oauth: dict[str, Any] = {
+                "provider": "databricks",
+                "clientId": current.get("oauthClientId"),
+                "clientSecret": {"type": "plain", "value": oauth_client_secret},
+                "metadataUrl": current.get("oauthMetadataUrl"),
+                "scopes": current.get("oauthScopes") or [],
+            }
+            if current.get("oauthIdpType") is not None:
+                oauth["idpType"] = current["oauthIdpType"]
+            if current.get("oauthUsePkce") is not None:
+                oauth["usePkce"] = current["oauthUsePkce"]
+            if current.get("oauthUseJwt") is not None:
+                oauth["useJwt"] = current["oauthUseJwt"]
+            if current.get("oauthAudience") is not None:
+                oauth["audience"] = current["oauthAudience"]
+            if not oauth["clientId"] or not oauth["metadataUrl"]:
+                raise ValueError("Retrieved connection is missing its OAuth client ID or metadata URL.")
+            details["oauth"] = oauth
 
     database_key = "writeCatalog" if connection_type in CATALOG_CONNECTION_TYPES else "writeDatabase"
     location = {database_key: catalog, "writeSchema": schema}
@@ -108,7 +132,7 @@ def add_writeback_location(
             for entry in locations
         )
 
-    if details.get("useOauth"):
+    if details["useOauth"]:
         fetched = current.get("writebackSchemas", [])
         if not isinstance(fetched, list):
             raise ValueError("Retrieved writebackSchemas must be an array.")
@@ -127,7 +151,17 @@ def add_writeback_location(
         writebacks.append(location)
         details["writeAccess"] = writebacks
 
-    return updated
+    payload: dict[str, Any] = {"name": name, "details": details}
+    if current.get("description") is not None:
+        payload["description"] = deepcopy(current["description"])
+    if current.get("poolSizes") is not None:
+        payload["poolSizes"] = deepcopy(current["poolSizes"])
+    timeout = current.get("timeout")
+    if isinstance(timeout, dict) and timeout.get("default") is not None:
+        payload["timeoutSecs"] = timeout["default"]
+    if current.get("friendlyName") is not None:
+        payload["useFriendlyNames"] = current["friendlyName"]
+    return payload
 
 
 def get_access_token(base_url: str, client_id: str, client_secret: str) -> str:
@@ -215,9 +249,21 @@ def main() -> int:
         token = get_access_token(base_url, client_id, client_secret)
         connection_id = resolve_connection_id(base_url, token, args.connection_name)
         current = get_connection(base_url, token, connection_id)
-        payload = add_writeback_location(
-            load_payload(args.payload_file), current, args.catalog, args.schema
+        payload = build_update_payload(
+            current,
+            args.catalog,
+            args.schema,
+            os.environ.get("DATABRICKS_OAUTH_CLIENT_SECRET", ""),
         )
+        if args.output_payload:
+            try:
+                with open(args.output_payload, "x", encoding="utf-8") as output_file:
+                    json.dump(payload, output_file, indent=2)
+                    output_file.write("\n")
+            except FileExistsError as exc:
+                raise ValueError(f"Refusing to overwrite existing file {args.output_payload!r}.") from exc
+            except OSError as exc:
+                raise ValueError(f"Unable to write payload file {args.output_payload!r}: {exc}") from exc
         if args.dry_run:
             print(json.dumps(payload, indent=2))
             print("[DRY RUN] Retrieved the connection; no Sigma API update was submitted.")
